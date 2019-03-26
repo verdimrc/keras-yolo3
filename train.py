@@ -2,50 +2,82 @@
 Retrain the YOLO model for your own dataset.
 """
 
+import argparse
 import numpy as np
 import keras.backend as K
 from keras.layers import Input, Lambda
 from keras.models import Model
 from keras.optimizers import Adam
 from keras.callbacks import TensorBoard, ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+import sys
+from typing import List
 
 from yolo3.model import preprocess_true_boxes, yolo_body, tiny_yolo_body, yolo_loss
 from yolo3.utils import get_random_data
 
+PHASE1_MINIBATCH = 16 #32
+PHASE1_EPOCHS = 2 #5
+PHASE1_INITIAL_EPOCHS = 0
 
-def _main():
-    annotation_path = 'train.txt'
-    log_dir = 'logs/000/'
-    classes_path = 'model_data/voc_classes.txt'
-    anchors_path = 'model_data/yolo_anchors.txt'
+PHASE2_MINIBATCH = 16 #32
+PHASE2_EPOCHS = 2 #100
+PHASE2_INITIAL_EPOCHS = 1 #50
+
+
+def get_ann(annotation_path: str) -> List[str]:
+    with open(annotation_path) as f:
+        lines = f.readlines()
+    np.random.seed(10101)
+    np.random.shuffle(lines)
+    np.random.seed(None)
+    return lines
+
+
+def _main(args: argparse.Namespace):
+    # Setup filenames
+    train_ann_path = args.train_ann
+    valid_ann_path = args.valid_ann
+    classes_path = args.classes
+    log_dir = args.log_dir
+    anchors_path = args.anchors
+    weights_path = args.weights
+
+    # Load classes & anchors
     class_names = get_classes(classes_path)
     num_classes = len(class_names)
     anchors = get_anchors(anchors_path)
 
+    # All images will be resized to this size.
     input_shape = (416,416) # multiple of 32, hw
 
+    # Create model with pretrained weights
     is_tiny_version = len(anchors)==6 # default setting
+    print('is_tiny_version =', is_tiny_version)
     if is_tiny_version:
         model = create_tiny_model(input_shape, anchors, num_classes,
-            freeze_body=2, weights_path='model_data/tiny_yolo_weights.h5')
+            freeze_body=2, weights_path=weights_path)
     else:
         model = create_model(input_shape, anchors, num_classes,
-            freeze_body=2, weights_path='model_data/yolo_weights.h5') # make sure you know what you freeze
+            freeze_body=2, weights_path=weights_path) # make sure you know what you freeze
 
+    # Setup logging & stopping criteria
     logging = TensorBoard(log_dir=log_dir)
     checkpoint = ModelCheckpoint(log_dir + 'ep{epoch:03d}-loss{loss:.3f}-val_loss{val_loss:.3f}.h5',
         monitor='val_loss', save_weights_only=True, save_best_only=True, period=3)
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=3, verbose=1)
     early_stopping = EarlyStopping(monitor='val_loss', min_delta=0, patience=10, verbose=1)
 
-    val_split = 0.1
-    with open(annotation_path) as f:
-        lines = f.readlines()
-    np.random.seed(10101)
-    np.random.shuffle(lines)
-    np.random.seed(None)
-    num_val = int(len(lines)*val_split)
+    # Load train & validation annotations
+    train_lines = get_ann(train_ann_path)
+    valid_lines = get_ann(valid_ann_path)
+
+    # Concatenate train & validation lines into a single list. This prevents changing existing
+    # code which expects train:valid splits = lines[:num_train], lines[num_train:].
+    lines = train_lines + valid_lines
+    #lines = train_lines[:1000] + valid_lines
+    num_val = len(valid_lines)
     num_train = len(lines) - num_val
+    del train_lines, valid_lines
 
     # Train with frozen layers first, to get a stable loss.
     # Adjust num epochs to your dataset. This step is enough to obtain a not bad model.
@@ -54,14 +86,14 @@ def _main():
             # use custom yolo_loss Lambda layer.
             'yolo_loss': lambda y_true, y_pred: y_pred})
 
-        batch_size = 32
+        batch_size = PHASE1_MINIBATCH
         print('Train on {} samples, val on {} samples, with batch size {}.'.format(num_train, num_val, batch_size))
         model.fit_generator(data_generator_wrapper(lines[:num_train], batch_size, input_shape, anchors, num_classes),
                 steps_per_epoch=max(1, num_train//batch_size),
                 validation_data=data_generator_wrapper(lines[num_train:], batch_size, input_shape, anchors, num_classes),
                 validation_steps=max(1, num_val//batch_size),
-                epochs=50,
-                initial_epoch=0,
+                epochs=PHASE1_EPOCHS,
+                initial_epoch=PHASE1_INITIAL_EPOCHS,
                 callbacks=[logging, checkpoint])
         model.save_weights(log_dir + 'trained_weights_stage_1.h5')
 
@@ -73,14 +105,14 @@ def _main():
         model.compile(optimizer=Adam(lr=1e-4), loss={'yolo_loss': lambda y_true, y_pred: y_pred}) # recompile to apply the change
         print('Unfreeze all of the layers.')
 
-        batch_size = 32 # note that more GPU memory is required after unfreezing the body
+        batch_size = PHASE2_MINIBATCH # note that more GPU memory is required after unfreezing the body
         print('Train on {} samples, val on {} samples, with batch size {}.'.format(num_train, num_val, batch_size))
         model.fit_generator(data_generator_wrapper(lines[:num_train], batch_size, input_shape, anchors, num_classes),
             steps_per_epoch=max(1, num_train//batch_size),
             validation_data=data_generator_wrapper(lines[num_train:], batch_size, input_shape, anchors, num_classes),
             validation_steps=max(1, num_val//batch_size),
-            epochs=100,
-            initial_epoch=50,
+            epochs=PHASE2_EPOCHS,
+            initial_epoch=PHASE2_INITIAL_EPOCHS,
             callbacks=[logging, checkpoint, reduce_lr, early_stopping])
         model.save_weights(log_dir + 'trained_weights_final.h5')
 
@@ -187,4 +219,21 @@ def data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, n
     return data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes)
 
 if __name__ == '__main__':
-    _main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-t', '--train-ann', help='Filename of train annotation', default=None)
+    parser.add_argument('-d', '--valid-ann', help='Filename of validation annotation', default=None)
+    parser.add_argument('-c', '--classes', help='Filename of classes', default=None)
+    parser.add_argument('-l', '--log-dir', help='Directory to store logs', default='./logs')
+    parser.add_argument('-a', '--anchors', help='Filename of anchors', default='./model_data/yolo_anchors.txt')
+    parser.add_argument('-w', '--weights', help='Filename of .h5 weights', default='./model_data/yolo.h5')
+    args = parser.parse_args()
+
+    # Make sure these args are specified
+    opts = vars(args)
+    for i in ['train_ann', 'valid_ann', 'classes']:
+        if opts[i] is None:
+            print('Missing', i.upper())
+            parser.print_help()
+            sys.exit(-1)
+
+    _main(args)
