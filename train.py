@@ -15,13 +15,13 @@ from typing import List
 from yolo3.model import preprocess_true_boxes, yolo_body, tiny_yolo_body, yolo_loss
 from yolo3.utils import get_random_data
 
-PHASE1_MINIBATCH = 16 #32
-PHASE1_EPOCHS = 2 #5
+PHASE1_MINIBATCH = 16       #32
+PHASE1_EPOCHS = 20          #50
 PHASE1_INITIAL_EPOCHS = 0
 
-PHASE2_MINIBATCH = 16 #32
-PHASE2_EPOCHS = 2 #100
-PHASE2_INITIAL_EPOCHS = 1 #50
+PHASE2_MINIBATCH = 16       #32
+PHASE2_EPOCHS = 40          #100
+PHASE2_INITIAL_EPOCHS = 20  #50
 
 
 def get_ann(annotation_path: str) -> List[str]:
@@ -30,6 +30,8 @@ def get_ann(annotation_path: str) -> List[str]:
     np.random.seed(10101)
     np.random.shuffle(lines)
     np.random.seed(None)
+
+
     return lines
 
 
@@ -71,12 +73,17 @@ def _main(args: argparse.Namespace):
     train_lines = get_ann(train_ann_path)
     valid_lines = get_ann(valid_ann_path)
 
+    # Downsample train_lines, if requested.
+    if args.train_ratio < 100:
+        # Take the first x% of train data.
+        downsampled_train_cnt = int(len(train_lines) * (args.train_ratio / 100))
+        print(f'Use {downsampled_train_cnt} train samples out of {len(train_lines)}')
+        train_lines = train_lines[:downsampled_train_cnt]
+
     # Concatenate train & validation lines into a single list. This prevents changing existing
     # code which expects train:valid splits = lines[:num_train], lines[num_train:].
     lines = train_lines + valid_lines
-    #lines = train_lines[:1000] + valid_lines
-    num_val = len(valid_lines)
-    num_train = len(lines) - num_val
+    num_train, num_val = len(train_lines), len(valid_lines)
     del train_lines, valid_lines
 
     # Train with frozen layers first, to get a stable loss.
@@ -218,6 +225,7 @@ def data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, n
     if n==0 or batch_size<=0: return None
     return data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes)
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-t', '--train-ann', help='Filename of train annotation', default=None)
@@ -226,6 +234,7 @@ if __name__ == '__main__':
     parser.add_argument('-l', '--log-dir', help='Directory to store logs', default='./logs')
     parser.add_argument('-a', '--anchors', help='Filename of anchors', default='./model_data/yolo_anchors.txt')
     parser.add_argument('-w', '--weights', help='Filename of .h5 weights', default='./model_data/yolo.h5')
+    parser.add_argument('-r', '--train-ratio', help='Percentage of training data to use (1-100)', type=int, default=100)
     args = parser.parse_args()
 
     # Make sure these args are specified
@@ -235,5 +244,11 @@ if __name__ == '__main__':
             print('Missing', i.upper())
             parser.print_help()
             sys.exit(-1)
+
+    if not (0 <= args.train_ratio <= 100):
+        print(f'Invalid train_ratio {args.train_ratio}; please specify 0-100.')
+
+    # Display essential configurations
+    print(f'Use {args.train_ratio}% of train data')
 
     _main(args)
